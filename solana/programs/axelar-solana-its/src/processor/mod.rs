@@ -1,7 +1,9 @@
 //! Program state processor
-use axelar_executable::{validate_with_gmp_metadata, PROGRAM_ACCOUNTS_START_INDEX};
+use axelar_executable::{parse_get_instructions, validate_with_gmp_metadata, PROGRAM_ACCOUNTS_START_INDEX};
 use axelar_solana_encoding::types::messages::Message;
 use axelar_solana_gateway::error::GatewayError;
+use axelar_solana_gateway::{find_message_payload_pda, get_gateway_root_config_pda, get_incoming_message_pda};
+use axelar_solana_gateway::state::incoming_message::command_id;
 use axelar_solana_gateway::state::message_payload::ImmutMessagePayload;
 use axelar_solana_gateway::state::GatewayConfig;
 use borsh::BorshDeserialize;
@@ -21,12 +23,13 @@ use solana_program::program_error::ProgramError;
 use solana_program::pubkey::Pubkey;
 use solana_program::sysvar::Sysvar;
 use solana_program::{msg, system_program};
+use solana_program::instruction::Instruction;
+use solana_program::program::set_return_data;
 
 use self::interchain_transfer::process_inbound_transfer;
 use self::token_manager::SetFlowLimitAccounts;
 use crate::instructions::{
-    self, its_account_indices, InterchainTokenServiceInstruction, OptionalAccountsFlags,
-    OutboundInstructionInputs,
+    self, its_account_indices, its_gmp_payload, InterchainTokenServiceInstruction, ItsGmpInstructionInputs, OptionalAccountsFlags, OutboundInstructionInputs
 };
 use crate::state::token_manager::TokenManager;
 use crate::state::InterchainTokenService;
@@ -52,6 +55,17 @@ pub fn process_instruction<'a>(
     instruction_data: &[u8],
 ) -> ProgramResult {
     check_program_account(*program_id)?;
+
+    if let Some(result) = parse_get_instructions(accounts, instruction_data) {
+        return match result {
+            Ok((message, payload)) => process_get_instructions(&accounts[0], message, payload),
+            Err(err) => {
+                msg!("Failed to deserialize instruction: {:?}", err);
+                return Err(err);
+            }
+        };
+    };
+
     let instruction = match InterchainTokenServiceInstruction::try_from_slice(instruction_data) {
         Ok(instruction) => instruction,
         Err(err) => {
@@ -577,5 +591,40 @@ fn validate_its_accounts(accounts: &[AccountInfo<'_>], payload: &GMPPayload) -> 
         }
     }
 
+    Ok(())
+}
+
+fn process_get_instructions<'a>(message_payload_pda: &AccountInfo<'a>, message: Message, payload: Vec<u8>) -> Result<(), ProgramError> {
+    let GMPPayload::ReceiveFromHub(inner) = GMPPayload::decode(&payload)
+        .map_err(|_err| ProgramError::InvalidInstructionData)?
+    else {
+        msg!("Unsupported GMP payload");
+        return Err(ProgramError::InvalidInstructionData);
+    };
+
+    let payload =
+        GMPPayload::decode(&inner.payload).map_err(|_err| ProgramError::InvalidInstructionData)?;
+
+
+    let command_id = command_id(&message.cc_id.chain, &message.cc_id.id);
+    let payer = Pubkey::new_unique(); // TODO: figure out dynamic funding.
+    let (gateway_incoming_message_pda, _bump) = get_incoming_message_pda(&command_id);
+    let token_program = Pubkey::new_unique(); // TODO: derive this properly.
+    let mint = None; // TODO: derive this properly.
+
+    // TODO: figure out timestamp.
+    let inputs = ItsGmpInstructionInputs::builder()        
+        .payer(payer)
+        .incoming_message_pda(gateway_incoming_message_pda)
+        .message_payload_pda(*message_payload_pda.key)
+        .message(message)
+        .payload(payload)
+        .token_program(token_program)
+        .mint_opt(mint)
+        .build();
+
+    let ixs = [its_gmp_payload( inputs)];
+    let data = bincode::serialize(&ixs).map_err(|_err| ProgramError::InvalidInstructionData)?;
+    set_return_data(&data);
     Ok(())
 }

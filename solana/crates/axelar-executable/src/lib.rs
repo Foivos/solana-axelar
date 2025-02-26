@@ -21,6 +21,8 @@ pub use axelar_payload::{
 
 /// Axelar executable command prefix
 pub const AXELAR_EXECUTE: &[u8; 16] = b"axelar-execute__";
+/// Get instruction command prefix
+pub const GET_INSTRUCTIONS: &[u8; 16] = b"get-instructions";
 
 /// The index of the first account that is expected to be passed to the
 /// destination program.
@@ -291,6 +293,34 @@ pub fn parse_axelar_message(input: &[u8]) -> Option<Result<Message, ProgramError
         .map_err(|borsh_error| ProgramError::BorshIoError(borsh_error.to_string()))
     {
         Ok(message) => Some(Ok(message)),
+        Err(err) => Some(Err(err)),
+    }
+}
+
+/// Tries to parse input into an Get Instruction.
+///
+/// # Errors
+/// Will return a `ProgramError::BorshIoError` if parsing fails.
+#[allow(clippy::indexing_slicing)]
+#[must_use]
+pub fn parse_get_instructions(accounts: &[AccountInfo<'_>], input: &[u8]) -> Option<Result<(Message, Vec<u8>), ProgramError>> {
+        // This pre-parsing check is required, otherwise borsh will exhaust the available
+    // memory trying to find a possibly missing `AXELAR_EXECUTE` prefix.
+    if !input.starts_with(GET_INSTRUCTIONS) || accounts.len() != 1 {
+        return None;
+    }
+
+    // Slicing: we already checked that slice's lower bound above.
+    match borsh::from_slice(&input[GET_INSTRUCTIONS.len()..])
+        .map_err(|borsh_error| ProgramError::BorshIoError(borsh_error.to_string()))
+    {
+        Ok(message) => {
+            let payload_account_data = accounts[0].try_borrow_data().ok()?;
+            let message_payload: ImmutMessagePayload<'_> = (**payload_account_data).try_into().ok()?;
+            let payload = message_payload.raw_payload.into();
+
+            Some(Ok((message, payload)))
+        },
         Err(err) => Some(Err(err)),
     }
 }
